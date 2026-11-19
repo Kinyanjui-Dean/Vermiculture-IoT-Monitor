@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vermiculture bed monitor</title>
+<style>
+:root{--bg:#eef2ec;--ink:#1f2a22;--mute:#5b6b5f;--card:#fff;--line:#d3dccf;--ok:#2f7a45;--warn:#b7791f;--bad:#b83a52;--chart:#2f6f8f}
+@media(prefers-color-scheme:dark){:root{--bg:#161d18;--ink:#e6efe7;--mute:#9db0a1;--card:#202a23;--line:#33423a;--ok:#5cc07a;--warn:#e0a84a;--bad:#ee7b90;--chart:#7cc3e0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 "Trebuchet MS","Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}
+h1{font-size:1.35rem;margin:0}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+select,input,button{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+button{cursor:pointer;font-weight:bold}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--chart);outline-offset:1px}
+#status{font-size:.95rem;color:var(--mute)}
+#status b{color:var(--ink)}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:var(--mute)}
+.on .dot{background:var(--ok)}.off .dot{background:var(--bad)}
+#banner{border-radius:14px;padding:18px 20px;margin-bottom:14px;font-size:1.3rem;font-weight:bold;border-left:10px solid var(--ok);background:var(--card)}
+#banner.bad{border-color:var(--bad)}
+#banner ul{margin:0;padding-left:20px}
+#banner small{display:block;font-weight:normal;font-size:.9rem;color:var(--mute);margin-top:4px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.card span{display:block;color:var(--mute);font-size:.9rem}
+.card strong{font-size:2rem;line-height:1.2}
+.card em{display:block;margin-top:4px;font-style:normal;font-size:.8rem;color:var(--warn)}
+.chart{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+.chart h2{font-size:1rem;margin:0 0 6px}
+canvas{width:100%;height:180px;display:block}
+details{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+summary{cursor:pointer;font-weight:bold}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:10px}
+label{display:block;font-size:.9rem;color:var(--mute)}
+label input{width:100%;margin-top:4px}
+footer{font-size:.85rem;color:var(--mute);margin-top:8px}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Vermiculture bed monitor</h1>
+  <div class="controls">
+    <label>Bed <select id="bed"></select></label>
+    <label>Show <select id="range">
+      <option value="3600000">Last hour</option>
+      <option value="21600000" selected>Last 6 hours</option>
+      <option value="86400000">Last 24 hours</option>
+      <option value="604800000">Last 7 days</option>
+    </select></label>
+    <button id="csv" type="button">Download data (CSV)</button>
+  </div>
+</header>
+
+<p id="status">Loading readings...</p>
+<div id="banner" role="status">Loading...</div>
+
+<section class="cards" aria-label="Latest readings">
+  <div class="card"><span>Soil moisture</span><strong id="v-pct">-</strong></div>
+  <div class="card"><span>Air temperature</span><strong id="v-t">-</strong></div>
+  <div class="card"><span>Air humidity</span><strong id="v-h">-</strong></div>
+  <div class="card"><span>Soil sensor raw value</span><strong id="v-raw">-</strong></div>
+  <div class="card"><span>pH</span><strong id="v-ph">-</strong><em>Simulated, not a real probe</em></div>
+</section>
+
+<section class="chart"><h2>Soil moisture (%)</h2><canvas id="c-pct"></canvas></section>
+<section class="chart"><h2>Air temperature (degrees C)</h2><canvas id="c-t"></canvas></section>
+<section class="chart"><h2>Air humidity (%)</h2><canvas id="c-h"></canvas></section>
+
+<details>
+  <summary>Alert settings</summary>
+  <div class="grid">
+    <label>Alert when soil moisture is below (%)<input id="s-dry" type="number" min="0" max="100"></label>
+    <label>Alert when air is hotter than (degrees C)<input id="s-hot" type="number"></label>
+    <label>Alert when air is colder than (degrees C)<input id="s-cold" type="number"></label>
+    <label>Mark device offline after (minutes)<input id="s-off" type="number" min="1"></label>
+  </div>
+</details>
+
+<footer>Data is read from the public ThingSpeak channel and refreshes every 30 seconds. Alerts show on this page only. Soil moisture percentage is only accurate after the sensor is calibrated.</footer>
+</main>
+
+<script>
+const CHANNEL = 3584721;
+const URL_FEED = "https://api.thingspeak.com/channels/" + CHANNEL + "/feeds.json?results=8000";
+const $ = id => document.getElementById(id);
+let ALL = [];
+let TH = { dry: 30, hot: 30, cold: 15, off: 10 };
+
+try { Object.assign(TH, JSON.parse(localStorage.getItem("vermi-th") || "{}")); } catch (e) {}
+["dry", "hot", "cold", "off"].forEach(k => {
+  $("s-" + k).value = TH[k];
+  $("s-" + k).addEventListener("change", () => {
+    const v = parseFloat($("s-" + k).value);
+    if (!isNaN(v)) TH[k] = v;
+    try { localStorage.setItem("vermi-th", JSON.stringify(TH)); } catch (e) {}
+    render();
+  });
+});
+
+function ago(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return m + " min ago";
+  if (m < 1440) return Math.round(m / 60) + " h ago";
+  return Math.round(m / 1440) + " days ago";
+}
+const fmt = (v, d) => isNaN(v) ? "-" : v.toFixed(d);
+
+function load() {
+  fetch(URL_FEED)
+    .then(r => r.json())
+    .then(j => {
+      ALL = (j.feeds || []).map(f => ({
+        x: Date.parse(f.created_at),
+        t: parseFloat(f.field1), h: parseFloat(f.field2), raw: parseFloat(f.field3),
+        ph: parseFloat(f.field4),
+        bed: f.field6 == null ? "1" : String(parseInt(f.field6)),
+        pct: parseFloat(f.field7)
+      })).filter(r => !isNaN(r.x));
+      fillBeds();
+      render();
+    })
+    .catch(() => {
+      $("status").textContent = "Could not load readings. Check your internet connection and try again.";
+      $("banner").textContent = "No data";
+      $("banner").className = "bad";
+    });
+}
+
+function fillBeds() {
+  const sel = $("bed"), cur = sel.value;
+  const beds = [...new Set(ALL.map(r => r.bed))].sort((a, b) => a - b);
+  sel.innerHTML = beds.map(b => '<option value="' + b + '">Bed ' + b + "</option>").join("");
+  if (beds.includes(cur)) sel.value = cur;
+}
+
+function render() {
+  const rows = ALL.filter(r => r.bed === $("bed").value);
+  if (!rows.length) {
+    $("status").textContent = "No readings yet for this bed.";
+    $("banner").textContent = "Waiting for the first reading";
+    $("banner").className = "";
+    return;
+  }
+  const last = rows[rows.length - 1];
+  const age = Date.now() - last.x;
+  const online = age < TH.off * 60000;
+  $("status").className = online ? "on" : "off";
+  $("status").innerHTML = '<span class="dot"></span><b>' + (online ? "Online" : "Offline") +
+    "</b>, last reading " + ago(age);
+
+  $("v-pct").textContent = fmt(last.pct, 0) + (isNaN(last.pct) ? "" : "%");
+  $("v-t").textContent = fmt(last.t, 1) + (isNaN(last.t) ? "" : " C");
+  $("v-h").textContent = fmt(last.h, 0) + (isNaN(last.h) ? "" : "%");
+  $("v-raw").textContent = fmt(last.raw, 0);
+  $("v-ph").textContent = fmt(last.ph, 1);
+
+  const bed = $("bed").value, alerts = [];
+  if (!online) alerts.push("Bed " + bed + " has sent nothing for " + ago(age).replace(" ago", "") + ". Check power and Wi-Fi.");
+  if (!isNaN(last.pct) && last.pct < TH.dry) alerts.push("Bed " + bed + " is dry (" + last.pct.toFixed(0) + "% moisture). Water it.");
+  if (!isNaN(last.t) && last.t > TH.hot) alerts.push("It is too hot (" + last.t.toFixed(1) + " C). Shade the bed.");
+  if (!isNaN(last.t) && last.t < TH.cold) alerts.push("It is too cold (" + last.t.toFixed(1) + " C). Cover the bed.");
+  const b = $("banner");
+  if (alerts.length) {
+    b.className = "bad";
+    b.innerHTML = "<ul>" + alerts.map(a => "<li>" + a + "</li>").join("") + "</ul>";
+  } else {
+    b.className = "";
+    b.innerHTML = "Bed " + bed + " looks fine<small>Moisture and temperature are within your alert limits.</small>";
+  }
+
+  const span = parseInt($("range").value);
+  const sub = rows.filter(r => r.x >= last.x - span);
+  const pick = k => sub.filter(r => !isNaN(r[k])).map(r => ({ x: r.x, y: r[k] }));
+  draw($("c-pct"), pick("pct"), span, 0, 100);
+  draw($("c-t"), pick("t"), span);
+  draw($("c-h"), pick("h"), span);
+}
+
+function draw(cv, pts, span, min, max) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const c = cv.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  const cs = getComputedStyle(document.documentElement);
+  const mute = cs.getPropertyValue("--mute"), line = cs.getPropertyValue("--line"), col = cs.getPropertyValue("--chart");
+  c.font = "12px sans-serif";
+  c.fillStyle = mute;
+  if (pts.length < 2) { c.fillText("Not enough readings in this time range yet.", 12, h / 2); return; }
+  let lo = Math.min(...pts.map(p => p.y)), hi = Math.max(...pts.map(p => p.y));
+  if (hi - lo < 1) { lo -= 0.5; hi += 0.5; }
+  const pad = (hi - lo) * 0.1; lo -= pad; hi += pad;
+  if (min !== undefined) lo = Math.max(lo, min);
+  if (max !== undefined) hi = Math.min(hi, max);
+  const L = 44, R = 10, T = 8, B = 22, x0 = pts[0].x, x1 = pts[pts.length - 1].x;
+  const X = t => L + (t - x0) / (x1 - x0 || 1) * (w - L - R);
+  const Y = v => T + (hi - v) / (hi - lo) * (h - T - B);
+  c.strokeStyle = line; c.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = Y(v);
+    c.beginPath(); c.moveTo(L, y); c.lineTo(w - R, y); c.stroke();
+    c.fillText(v.toFixed(1), 4, y + 4);
+  }
+  for (let i = 0; i <= 3; i++) {
+    const t = x0 + (x1 - x0) * i / 3, d = new Date(t);
+    const s = span > 86400000 ? d.toLocaleDateString([], { day: "numeric", month: "short" })
+                              : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    c.fillText(s, Math.min(Math.max(X(t) - 16, L), w - 44), h - 6);
+  }
+  c.strokeStyle = col; c.lineWidth = 2; c.beginPath();
+  pts.forEach((p, i) => i ? c.lineTo(X(p.x), Y(p.y)) : c.moveTo(X(p.x), Y(p.y)));
+  c.stroke();
+}
+
+$("csv").addEventListener("click", () => {
+  const rows = ALL.filter(r => r.bed === $("bed").value);
+  const v = n => isNaN(n) ? "" : n;
+  const lines = ["created_at_utc,bed_id,temperature_c,humidity_pct,soil_raw,soil_pct,ph_simulated"]
+    .concat(rows.map(r => [new Date(r.x).toISOString(), r.bed, v(r.t), v(r.h), v(r.raw), v(r.pct), v(r.ph)].join(",")));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+  a.download = "vermiculture_bed_" + $("bed").value + ".csv";
+  a.click();
+});
+
+$("bed").addEventListener("change", render);
+$("range").addEventListener("change", render);
+window.addEventListener("resize", render);
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
